@@ -7,23 +7,20 @@
 //! (keyed by `tunnel_id`), drives ARQ/CC, and provides the async interface used
 //! by both the client (SOCKS5) and server (TCP proxy) code.
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
-use dashmap::DashMap;
 use tokio::sync::{mpsc, Mutex, Notify};
 
-use crate::arq::{SrArq, MAX_WINDOW};
+use crate::arq::SrArq;
 use crate::congestion::CongestionControl;
 use crate::config::Config;
 use crate::packet::{CandyPacket, PacketKind};
 use crate::raw_socket::{OutPacket, RawSender};
-
-const HEARTBEAT_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
-const HEARTBEAT_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
 // ── Tunnel state ──────────────────────────────────────────────────────────────
 
@@ -45,7 +42,6 @@ struct Tunnel {
     /// Deliver received application data to the owner of this tunnel.
     app_tx:      mpsc::Sender<Bytes>,
     last_active: Instant,
-    last_heartbeat_sent: Instant,
     /// Notified whenever the send window opens (ACK received / window update).
     window_notify: Arc<Notify>,
     /// Notified when the tunnel transitions to Established.
@@ -68,7 +64,6 @@ impl Tunnel {
             cc:          CongestionControl::new(initial_cwnd),
             app_tx,
             last_active: Instant::now(),
-            last_heartbeat_sent: Instant::now(),
             window_notify:      Arc::new(Notify::new()),
             established_notify: Arc::new(Notify::new()),
         }
@@ -109,7 +104,7 @@ impl Tunnel {
     fn make_data_packet(&mut self, payload: Bytes) -> CandyPacket {
         const UNASSIGNED_SEQ: u32 = u32::MAX;
         let ack    = self.arq.recv_base();
-        let window = (MAX_WINDOW.saturating_sub(self.arq.in_flight())) as u16;
+        let window = (64u32.saturating_sub(self.arq.in_flight())) as u16;
         let mut pkt = CandyPacket::new_data(self.id, UNASSIGNED_SEQ, ack, window, payload);
         let _seq = self.arq.enqueue(&mut pkt); // assigns sequence and buffers retransmit copy
         pkt
@@ -137,9 +132,9 @@ pub struct PeerAddr {
 
 /// Inner state shared through an `Arc`.
 struct Inner {
-    tunnels:               DashMap<u32, Arc<Mutex<Tunnel>>>,
+    tunnels:               Mutex<HashMap<u32, Tunnel>>,
     /// Per-tunnel Notify fired when the tunnel reaches Established state.
-    established_notifiers: DashMap<u32, Arc<Notify>>,
+    established_notifiers: Mutex<HashMap<u32, Arc<Notify>>>,
     sender:  RawSender,
     addr:    PeerAddr,
     cfg:     Arc<Config>,
@@ -152,8 +147,8 @@ pub struct TunnelManager(Arc<Inner>);
 impl TunnelManager {
     pub fn new(sender: RawSender, addr: PeerAddr, cfg: Arc<Config>) -> Self {
         Self(Arc::new(Inner {
-            tunnels:               DashMap::new(),
-            established_notifiers: DashMap::new(),
+            tunnels:               Mutex::new(HashMap::new()),
+            established_notifiers: Mutex::new(HashMap::new()),
             sender,
             addr,
             cfg,
@@ -185,7 +180,7 @@ impl TunnelManager {
         // Grab the notifiers before inserting (to avoid re-locking).
         let window_notify      = tunnel.window_notify.clone();
         let established_notify = tunnel.established_notify.clone();
-        self.0.tunnels.insert(id, Arc::new(Mutex::new(tunnel)));
+        self.0.tunnels.lock().await.insert(id, tunnel);
 
         // Spawn a task that forwards application data to the raw socket.
         self.spawn_send_task(id, net_rx, window_notify);
@@ -196,7 +191,7 @@ impl TunnelManager {
 
         log::info!("tunnel {} opened (SYN sent)", id);
         // Store the established notifier so is_established can await it.
-        self.0.established_notifiers.insert(id, established_notify);
+        self.0.established_notifiers.lock().await.insert(id, established_notify);
         Ok((id, app_rx, net_tx))
     }
 
@@ -211,7 +206,7 @@ impl TunnelManager {
         let id = syn.tunnel_id;
 
         // Reject duplicate tunnels.
-        if self.0.tunnels.contains_key(&id) {
+        if self.0.tunnels.lock().await.contains_key(&id) {
             bail!("duplicate tunnel id {}", id);
         }
 
@@ -230,7 +225,7 @@ impl TunnelManager {
         // Server transitions to Established immediately after SYN-ACK.
         tunnel.state = TunnelState::Established;
         let window_notify = tunnel.window_notify.clone();
-        self.0.tunnels.insert(id, Arc::new(Mutex::new(tunnel)));
+        self.0.tunnels.lock().await.insert(id, tunnel);
 
         self.spawn_send_task(id, net_rx, window_notify);
 
@@ -243,11 +238,12 @@ impl TunnelManager {
 
     /// Close a tunnel and notify the peer.
     pub async fn close_tunnel(&self, id: u32) {
-        if let Some((_, t)) = self.0.tunnels.remove(&id) {
-            let mut t = t.lock().await;
+        let mut tunnels = self.0.tunnels.lock().await;
+        if let Some(t) = tunnels.get_mut(&id) {
             t.state = TunnelState::Closed;
         }
-        self.0.established_notifiers.remove(&id);
+        tunnels.remove(&id);
+        drop(tunnels);
 
         let fin = CandyPacket::new_fin(id);
         let _ = self.tx_control(fin).await;
@@ -269,15 +265,15 @@ impl TunnelManager {
             return Ok(Some((pkt, src_ip)));
         }
 
-        let tunnel = match self.0.tunnels.get(&pkt.tunnel_id) {
-            Some(t) => t.clone(),
+        let mut tunnels = self.0.tunnels.lock().await;
+
+        let t = match tunnels.get_mut(&pkt.tunnel_id) {
+            Some(t) => t,
             None => {
                 log::trace!("received packet for unknown tunnel {} from {}", pkt.tunnel_id, src_ip);
                 return Ok(None);
             }
         };
-
-        let mut t = tunnel.lock().await;
 
         t.touch();
 
@@ -290,8 +286,8 @@ impl TunnelManager {
                     let tid    = t.id;
                     let notify = t.established_notify.clone();
                     let wnotify = t.window_notify.clone();
-                    let ack = CandyPacket::new_ack(tid, pkt.seq.wrapping_add(1), MAX_WINDOW as u16);
-                    drop(t);
+                    let ack = CandyPacket::new_ack(tid, pkt.seq.wrapping_add(1), 64);
+                    drop(tunnels);
                     // Wake any task waiting for establishment.
                     notify.notify_waiters();
                     // Window may now be available.
@@ -314,7 +310,7 @@ impl TunnelManager {
 
             PacketKind::Nack => {
                 if let Some(retransmit) = t.arq.process_nack(pkt.seq) {
-                    drop(t);
+                    drop(tunnels);
                     self.tx_data(retransmit).await?;
                     return Ok(None);
                 }
@@ -322,18 +318,14 @@ impl TunnelManager {
 
             PacketKind::Data => {
                 let tid = t.id;
-                let app_tx = t.app_tx.clone();
                 let (deliverable, ack_num, nacks) = t.arq.receive(pkt.clone());
 
-                let window = (MAX_WINDOW.saturating_sub(t.arq.in_flight())) as u16;
-                drop(t);
-
                 for payload in deliverable {
-                    if app_tx.send(payload).await.is_err() {
-                        self.close_tunnel(tid).await;
-                        return Ok(None);
-                    }
+                    let _ = t.app_tx.try_send(payload);
                 }
+
+                let window = (64u32.saturating_sub(t.arq.in_flight())) as u16;
+                drop(tunnels);
 
                 self.tx_control(CandyPacket::new_ack(tid, ack_num, window)).await?;
                 for missing in nacks {
@@ -356,7 +348,7 @@ impl TunnelManager {
                     window:    0,
                     payload:   pkt.payload,
                 };
-                drop(t);
+                drop(tunnels);
                 self.tx_control(hb_ack).await?;
             }
 
@@ -385,23 +377,14 @@ impl TunnelManager {
     /// Drive retransmissions and send heartbeats.  Call every ~100 ms.
     pub async fn tick(&self) -> Result<()> {
         let (expired_pkts, heartbeats, _to_remove): (Vec<_>, Vec<_>, Vec<_>) = {
+            let mut tunnels = self.0.tunnels.lock().await;
             let mut exp  = Vec::new();
             let mut hbs  = Vec::new();
             let mut dead = Vec::new();
-            let now = Instant::now();
 
-            let tunnels: Vec<(u32, Arc<Mutex<Tunnel>>)> = self
-                .0
-                .tunnels
-                .iter()
-                .map(|entry| (*entry.key(), entry.value().clone()))
-                .collect();
-
-            for (id, tunnel) in tunnels {
-                let mut t = tunnel.lock().await;
-
+            for (id, t) in tunnels.iter_mut() {
                 if t.state == TunnelState::Closed {
-                    dead.push(id);
+                    dead.push(*id);
                     continue;
                 }
                 let timed_out = t.arq.take_timed_out();
@@ -409,19 +392,11 @@ impl TunnelManager {
                     t.on_loss();
                     exp.extend(timed_out);
                 }
-                if t.state == TunnelState::Established
-                    && t.is_idle(HEARTBEAT_IDLE_TIMEOUT)
-                    && now.duration_since(t.last_heartbeat_sent) >= HEARTBEAT_MIN_INTERVAL
-                {
-                    t.last_heartbeat_sent = now;
+                if t.state == TunnelState::Established && t.is_idle(Duration::from_secs(5)) {
                     hbs.push(CandyPacket::new_heartbeat(t.id, rand::random()));
                 }
             }
-
-            for id in &dead {
-                self.0.tunnels.remove(id);
-                self.0.established_notifiers.remove(id);
-            }
+            for id in &dead { tunnels.remove(id); }
             (exp, hbs, dead)
         };
 
@@ -440,31 +415,30 @@ impl TunnelManager {
 
         // Retrieve the notifier registered during open_tunnel.
         let notifier = {
-            self.0.established_notifiers.get(&id).map(|n| n.clone())
+            self.0
+                .established_notifiers
+                .lock()
+                .await
+                .get(&id)
+                .cloned()
         };
         let Some(notifier) = notifier else { return false; };
 
-        let established = tokio::time::timeout(timeout, notifier.notified())
+        tokio::time::timeout(timeout, notifier.notified())
             .await
             .is_ok()
-            && self.is_established(id).await;
-
-        if established {
-            self.0.established_notifiers.remove(&id);
-        }
-        established
+            && self.is_established(id).await
     }
 
     /// True if the tunnel with `id` is in the Established state.
     pub async fn is_established(&self, id: u32) -> bool {
-        let Some(tunnel) = self.0.tunnels.get(&id).map(|t| t.clone()) else {
-            return false;
-        };
-        let established = {
-            let guard = tunnel.lock().await;
-            guard.state == TunnelState::Established
-        };
-        established
+        self.0
+            .tunnels
+            .lock()
+            .await
+            .get(&id)
+            .map(|t| t.state == TunnelState::Established)
+            .unwrap_or(false)
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -497,11 +471,8 @@ impl TunnelManager {
                     // wake immediately.
                     loop {
                         let can = {
-                            if let Some(tunnel) = this.0.tunnels.get(&tunnel_id).map(|t| t.clone()) {
-                                tunnel.lock().await.can_send()
-                            } else {
-                                false
-                            }
+                            let tunnels = this.0.tunnels.lock().await;
+                            tunnels.get(&tunnel_id).map(|t| t.can_send()).unwrap_or(false)
                         };
                         if can { break; }
                         // Block until an ACK arrives and opens the window.
@@ -521,13 +492,10 @@ impl TunnelManager {
 
     async fn enqueue_and_send(&self, tunnel_id: u32, payload: Bytes) -> Result<()> {
         let pkt = {
-            let tunnel = self
-                .0
-                .tunnels
-                .get(&tunnel_id)
-                .map(|t| t.clone())
+            let mut tunnels = self.0.tunnels.lock().await;
+            let t = tunnels
+                .get_mut(&tunnel_id)
                 .ok_or_else(|| anyhow!("tunnel {} gone", tunnel_id))?;
-            let mut t = tunnel.lock().await;
             t.make_data_packet(payload)
         };
         self.tx_data(pkt).await
