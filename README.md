@@ -1,4 +1,4 @@
-# Candy-Spoof
+# mirza-Spoof
 
 > **⚠️ EDUCATIONAL PURPOSES ONLY**
 > This software is provided for educational, research, and authorized security testing purposes only. Users are responsible for ensuring compliance with all applicable laws and regulations in their jurisdiction. Unauthorized use of IP spoofing may be illegal and unethical. The authors assume no liability for misuse of this software.
